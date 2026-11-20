@@ -5,9 +5,11 @@ echo server on Linux, using the socket APIs directly.
 
 ## Current phase
 
-Phase 2 implements a blocking TCP echo server bound to `127.0.0.1:9090`.
-It echoes raw bytes for one connected client at a time. An idle or slow client
-can delay every subsequent client; Phase 3 will address this using `poll`.
+Phase 3 adds a single-threaded, nonblocking TCP echo server using `poll`.
+It serves up to 128 clients with at most 64 KiB of queued output per client.
+The Phase 2 blocking server remains available to reproduce the single-client
+bottleneck. Both default to `127.0.0.1:9090`; run them separately or use
+different port arguments.
 
 ## Build and run
 
@@ -18,6 +20,9 @@ for client experiments. `strace` is optional for syscall inspection.
 make
 ./blocking_server
 ```
+
+For the concurrent Phase 3 server, run `./poll_server` instead. It also accepts
+an optional port, for example `./poll_server 9091`.
 
 In a second terminal, connect and type a message:
 
@@ -39,10 +44,11 @@ nc 127.0.0.1 9091
 Ports must be decimal integers from 1 to 65535. Startup errors, including an
 occupied port, print a diagnostic and return a nonzero exit status.
 
-Run the repeatable Phase 2 checks and remove build output with:
+Run all repeatable checks and remove build output with:
 
 ```sh
 make test
+make test-poll  # Phase 3 only
 make clean
 ```
 
@@ -55,9 +61,9 @@ The build uses C++17, compiler warnings, debug symbols, and no optimization:
 g++ -std=c++17 -Wall -Wextra -Wpedantic -g -O0 -o blocking_server blocking_server.cpp
 ```
 
-`make` and `make blocking_server` build the same executable. `make clean`
-removes the three planned server executables. Poll and epoll build targets
-will be added when their source files exist.
+`make` builds both servers. `make blocking_server` and `make poll_server` build
+individual variants. `make clean` removes server and test executables. The
+epoll build target will be added when its source exists.
 
 ## Roadmap
 
@@ -148,6 +154,10 @@ not count as verification.
 | Phase 2: half-close | Echo is delivered before server EOF | Full response followed by EOF | Client write shutdown leaves its receive direction open | shutdown, recv, close |
 | Phase 2: second client | Connection may establish but echo waits | Second receive timed out while first was idle; echo arrived after first sent EOF | Kernel queues connections while the application handles the first client | listen, accept, recv |
 | Phase 2: reset recovery | Client failure leaves server available | Echo succeeded on a new connection after a reset | Connection failure returns to the accept loop | recv, send, close |
+| Phase 3: idle, slow, active clients | Active clients progress while others wait | Ten short binary echoes completed while one client was idle and another delayed reads; the 8 MiB slow-client echo matched exactly | Nonblocking I/O yields to the event loop; each client retains its own pending output | poll, recv, send |
+| Phase 3: queue limits | Full queues pause reads and retain unsent bytes | Socket-pair checks filled the 64 KiB queue, forced EAGAIN and positive short sends, and verified read resumption below 32 KiB | Interest masks follow queue state and send offsets | recv, send, poll interest calculation |
+| Phase 3: EOF and cleanup | Pending output survives EOF and resources are released | EOF flush checks passed; descriptor count settled after 100 connect/disconnect cycles and reset recovery; excess client was rejected at 128 clients | Read EOF and connection close are separate transitions | shutdown, recv, send, close |
+| Phase 3: idle CPU | The event loop sleeps when no client has work | Server CPU ticks remained within the check's five-tick allowance over 300 ms | Empty output queues do not request POLLOUT; poll uses an infinite timeout | poll |
 
 ## Phase 1 acceptance checks
 
@@ -173,6 +183,67 @@ Send text from the first and leave it open. Text from the second will not be
 echoed until the first disconnects. A successful TCP connection only confirms
 that the kernel established it; the application may still be busy before its
 next `accept` call.
+
+## Phase 3 connection model
+
+`poll_server.cpp` keeps connection state in `std::unordered_map<int, Connection>`.
+A `std::vector<pollfd>` is rebuilt from that map before each `poll(..., -1)`.
+The vector is a snapshot, so removing connections does not invalidate traversal.
+New clients are accepted after processing the snapshot, preventing newly reused
+descriptor numbers from receiving stale readiness events.
+
+The listener and every accepted socket use `O_NONBLOCK`, preserving existing
+`fcntl` flags. `accept` and `recv` drain available work until `EAGAIN`, an error,
+EOF, or a queue bound. Each read pass queues at most 64 KiB before trying sends,
+so one streaming client cannot keep the receive loop running indefinitely.
+
+Readiness is permission to attempt I/O. `events` is the requested mask;
+`revents` is the returned mask. Check flags with bitwise `&`, because several
+can occur together. `EAGAIN`/`EWOULDBLOCK` means yield and wait for readiness;
+`EINTR` means retry the interrupted operation.
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Bytes received for echo, including a possibly sent prefix |
+| `sent_offset` | Prefix already accepted by successful sends |
+| `read_eof` | `recv` returned zero; no more reads are needed |
+| `read_paused` | Stop reading until queued output drops below the low-water mark |
+
+Unsent output is `pending.size() - sent_offset`. The server attempts sends
+after queuing a read batch and watches `POLLOUT` only if bytes remain. A short
+send advances the offset; `EAGAIN` preserves the suffix for a later pass.
+Leaving `POLLOUT` enabled on an empty queue would repeatedly wake `poll`.
+
+At 64 KiB of unsent output, reads pause. Below 32 KiB they resume. Each receive
+is limited to remaining capacity, and consumed prefixes are compacted before
+appending. The output vector reserves 64 KiB per accepted client. These bounds
+cover application output storage; kernel socket buffers are separate. Pausing
+reads eventually pushes pressure back through TCP to a sender whose peer is
+not reading fast enough.
+
+`recv == 0` stops reads but does not discard queued output: the connection
+closes only after that output drains. `POLLHUP` may coexist with unread data,
+so it triggers a receive attempt rather than immediate close. Fatal client
+errors close only that connection; listener failures stop the server.
+
+## Phase 3 acceptance checks
+
+`make test-poll` runs two checks:
+
+- `test_poll_state.cpp` uses nonblocking socket pairs and a small send buffer
+  to force `EAGAIN` and positive partial sends. It checks exact bytes, queue
+  limits, read pause/resume, conditional `POLLOUT`, and output flushing after EOF.
+- `test_poll.py` runs the actual TCP server and checks startup errors, binary
+  echo, concurrent idle/slow/active clients, an 8 MiB payload with delayed reads,
+  half-close, idle CPU use, repeated connection cleanup, reset recovery, and the
+  128-client limit. It reads Linux `/proc` for descriptor and CPU observations.
+
+To observe concurrency manually, open two `nc` clients against `poll_server`.
+Leave the first idle and type in the second: its echo should arrive immediately.
+The same experiment against `blocking_server` waits for the first to disconnect.
+
+These checks do not force signal interruption or constitute a load benchmark.
+There is no application shutdown handler; Ctrl+C lets the OS release descriptors.
 
 ## Project documentation
 
