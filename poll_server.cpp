@@ -218,7 +218,11 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Poll echo server listening on 127.0.0.1:" << port << std::endl;
     std::unordered_map<int, Connection> connections;
-    std::vector<pollfd> watched;
+    std::vector<pollfd> watched; // consists of fd, events, and revents
+    // POLLIN -> accept() on listening socket and recv() on client socket
+    // POLLOUT -> can accept some outgoing bytes, send() can still write only part of the buffer
+    // POLLHUP -> hang up
+    // POLLERR/POLLNVAL -> socket error or invalid descriptor
     int status = 0;
     for (;;) {
         // A snapshot keeps traversal valid when the owning map changes.
