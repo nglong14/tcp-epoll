@@ -1,5 +1,6 @@
-"""Phase 3 integration checks. Run with: make test-poll"""
+"""Readiness server integration checks. Run with make test-poll or make test-epoll."""
 
+import argparse
 import socket
 import struct
 import subprocess
@@ -10,26 +11,27 @@ from pathlib import Path
 from test_blocking import receive_exact
 
 
-SERVER = str(Path(__file__).resolve().with_name("poll_server"))
-
-
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server", nargs="?", type=Path, default=Path(__file__).with_name("poll_server"))
+    server = parser.parse_args().server.resolve()
+
     for port in ("0", "65536", "-1", "abc", "9090x", ""):
-        result = subprocess.run([SERVER, port], capture_output=True, timeout=3)
+        result = subprocess.run([server, port], capture_output=True, timeout=3)
         assert result.returncode != 0 and b"Invalid port" in result.stderr
 
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()
         port = occupied.getsockname()[1]
-        result = subprocess.run([SERVER, str(port)], capture_output=True, timeout=3)
+        result = subprocess.run([server, str(port)], capture_output=True, timeout=3)
         assert result.returncode != 0 and b"bind" in result.stderr
 
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     process = subprocess.Popen(
-        [SERVER, str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        [server, str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
     def connect():
@@ -42,13 +44,13 @@ def main():
             assert receive_exact(client, len(payload)) == payload
             assert client.recv(1) == b"", "expected EOF after echo"
 
-    def fd_count():
-        return len(list(Path(f"/proc/{process.pid}/fd").iterdir()))
+    def socket_count():
+        return sum(fd.is_socket() for fd in Path(f"/proc/{process.pid}/fd").iterdir())
 
-    def wait_for_fds(expected):
+    def wait_for_clients_to_close():
         deadline = time.monotonic() + 3
-        while fd_count() != expected:
-            assert time.monotonic() < deadline, "descriptor count did not settle"
+        while socket_count() != 1:  # Only the listener should remain.
+            assert time.monotonic() < deadline, "socket count did not settle"
             time.sleep(0.01)
 
     try:
@@ -64,8 +66,7 @@ def main():
                     raise
                 time.sleep(0.01)
 
-        baseline_fds = 4  # stdin, stdout, stderr, listener
-        wait_for_fds(baseline_fds)
+        wait_for_clients_to_close()
         echo(b"hello\x00binary\xff\n")
 
         with connect() as idle, connect() as slow:
@@ -96,7 +97,7 @@ def main():
             sender.join(timeout=3)
             assert not sender.is_alive() and not errors, errors
 
-            # Idle sockets should let poll sleep, rather than spin on POLLOUT.
+            # Idle sockets should let the server sleep without writable wakeups.
             stat = Path(f"/proc/{process.pid}/stat")
             before = sum(map(int, stat.read_text().split()[13:15]))
             time.sleep(0.3)
@@ -105,12 +106,12 @@ def main():
 
         for _ in range(100):
             echo(b"connect/disconnect")
-        wait_for_fds(baseline_fds)
+        wait_for_clients_to_close()
         with connect() as client:
             client.sendall(b"reset" * 16384)
             client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         echo(b"alive after reset")
-        wait_for_fds(baseline_fds)
+        wait_for_clients_to_close()
 
         clients = []
         try:
@@ -127,7 +128,7 @@ def main():
         finally:
             for client in clients:
                 client.close()
-        wait_for_fds(baseline_fds)
+        wait_for_clients_to_close()
         echo(b"capacity recovered")
         print("PASS: startup, binary/8 MiB echo, idle + slow + active clients,")
         print("      half-close, idle CPU, fd cleanup, reset recovery, 128-client limit")
